@@ -12,5 +12,6 @@ aclocal.m4
 autom4te.cache
 stamp-h1
 mkr2i
+password_server
 rar2fs
 unrar

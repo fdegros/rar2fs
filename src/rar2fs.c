@@ -27,11 +27,13 @@
 */
 #include <platform.h>
 #include <stdio.h>
+#include <sys/select.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
-#include <sys/select.h>
-#include <sys/wait.h>
 #include <sys/time.h>
+#include <sys/un.h>
+#include <sys/wait.h>
 #include <signal.h>
 #include <string.h>
 #include <errno.h>
@@ -200,8 +202,9 @@ static const char *file_cmd[] = {
 
 /* Strict mount options (-o) */
 struct rar2fs_mount_opts {
-     char *locale;
-     int warmup;
+        char *password_socket_name;
+        char *locale;
+        int warmup;
 };
 
 #define RAR2FS_MOUNT_OPT(t, p, v) \
@@ -455,13 +458,103 @@ static inline int is_nnn_vol(const char *name)
 #define prop_type_ wchar
 #define prop_alloc_type_ wchar_t
 #define prop_memcpy_ wmemcpy
-static wchar_t *get_password(const char *file, wchar_t *buf, size_t len)
 #else
 #define prop_type_ char
 #define prop_alloc_type_ char
 #define prop_memcpy_ memcpy
-static char *get_password(const char *file, char *buf, size_t len)
 #endif
+
+wchar_t *str_to_wide(const char *const s)
+{
+        const ssize_t n = mbstowcs(NULL, s, 0);
+        if (n < 0) {
+                perror("Cannot convert string to wide chars");
+                return NULL;
+        }
+
+        wchar_t *const ret = calloc(n + 1, sizeof(wchar_t));
+        if (!ret) {
+                perror("Cannot allocate memory");
+                return NULL;
+        }
+
+        mbstowcs(ret, s, n + 1);
+        return ret;
+}
+
+static pthread_mutex_t cached_password_mutex = PTHREAD_MUTEX_INITIALIZER;
+static const wchar_t *cached_password = NULL;
+
+/*!
+*****************************************************************************
+* Gets the password by querying the password server through the password socket.
+* Returns a pointer to a cached string, or NULL in case of error.
+* The returned string does not need to be freed or deallocated.
+****************************************************************************/
+static const wchar_t *get_password_from_socket(const char *for_file)
+{
+
+        const wchar_t *ret = NULL;
+        int sfd = -1;
+
+        pthread_mutex_lock(&cached_password_mutex);
+        {
+                if (cached_password) {
+                        ret = cached_password;
+                        goto exit;
+                }
+
+                printf("Need password for '%s'\n", for_file);
+
+                sfd = socket(AF_UNIX, SOCK_STREAM, 0);
+                if (sfd < 0) {
+                        perror("Cannot create socket");
+                        goto exit;
+                }
+
+                struct sockaddr_un addr;
+                memset(&addr, 0, sizeof(addr));
+                addr.sun_family = AF_UNIX;
+                strncpy(addr.sun_path,
+                        rar2fs_mount_opts.password_socket_name
+                            ?: "/tmp/password_socket",
+                        sizeof(addr.sun_path) - 1);
+
+                if (connect(sfd, &addr, sizeof(addr)) < 0) {
+                        perror("Cannot connect socket");
+                        goto exit;
+                }
+
+                const size_t for_file_len = strlen(for_file);
+                ssize_t n = write(sfd, for_file, for_file_len);
+                if (n < 0) {
+                        perror("Cannot write to socket");
+                        goto exit;
+                }
+
+                const size_t buf_size = 1024;
+                char buf[buf_size];
+                n = read(sfd, buf, buf_size - 1);
+                if (n < 0) {
+                        perror("Cannot read from socket");
+                        goto exit;
+                }
+
+                buf[n] = '\0';
+                printf("Received '%s'\n", buf);
+                ret = cached_password = str_to_wide(buf);
+        }
+
+exit:
+        pthread_mutex_unlock(&cached_password_mutex);
+
+        if (sfd >= 0 && close(sfd) < 0)
+                perror("Cannot close socket");
+
+        return ret;
+}
+
+static prop_alloc_type_ *get_password(const char *file, prop_alloc_type_ *buf, size_t len)
 {
         char *f[2] = {NULL, NULL};
         int l[2] = {0, 0};
@@ -474,6 +567,14 @@ static char *get_password(const char *file, char *buf, size_t len)
 
         if (!file)
                 return NULL;
+
+        password = get_password_from_socket(file);
+        if (password) {
+                wcsncpy(buf, password, len);
+                buf[len - 1] = L'\0';
+
+                return buf;
+        }
 
         rar = strdup(file);
         tmp = rar;
@@ -539,6 +640,7 @@ static char *get_password(const char *file, char *buf, size_t len)
                                         if (eol != NULL)
                                                 *eol = 0;
                                 }
+                                printf("<<< get_password -> return '%ls'\n", buf);
 #else
                                 buf = fgets(buf, len, fp);
 #endif
@@ -714,6 +816,7 @@ static FILE *popen_(const struct filecache_entry *entry_p, pid_t *cpid)
 
         pid = fork();
         if (pid == 0) {
+                printf(">>> Process %i started\n", getpid());
                 int ret;
                 setpgid(getpid(), 0);
                 close(pfd[0]);  /* Close unused read end */
@@ -721,6 +824,8 @@ static FILE *popen_(const struct filecache_entry *entry_p, pid_t *cpid)
                                   entry_p->file_p,
                                   (void *)(uintptr_t) pfd[1]);
                 close(pfd[1]);
+                printf("<<< Process %i finished with exit code %i\n", getpid(),
+                       ret);
                 _exit(ret);
         } else if (pid < 0) {
                 /* The fork failed. */
@@ -5406,6 +5511,7 @@ enum {
 
 static struct fuse_opt rar2fs_opts[] = {
 #ifdef HAVE_SETLOCALE
+        RAR2FS_MOUNT_OPT("password_socket=%s", password_socket_name, 0),
         RAR2FS_MOUNT_OPT("locale=%s", locale, 0),
         RAR2FS_MOUNT_OPT("warmup=%d", warmup, 0),
         RAR2FS_MOUNT_OPT("warmup", warmup, 5),
